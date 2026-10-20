@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: discord-role-bot
+    name: discord-role-bot-eu
     env: docker
     plan: free
     region: frankfurt
