@@ -9,7 +9,16 @@ namespace DiscordRoleBot;
 class Program
 {
     private const ulong AdminUserId = 1525762942081962096;
-    private DiscordSocketClient? _client;
+    private static DiscordSocketClient? _client;
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<string> _logs = new();
+
+    public static void AddLog(string msg)
+    {
+        var line = $"[{DateTime.UtcNow:HH:mm:ss}] {msg}";
+        Console.WriteLine(line);
+        _logs.Enqueue(line);
+        while (_logs.Count > 100) _logs.TryDequeue(out _);
+    }
 
     public static async Task Main(string[] args)
     {
@@ -19,41 +28,63 @@ class Program
 
     public async Task RunAsync()
     {
-        // 1. Get token safely from Environment Variable or use provided default
-        var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN") 
-                    ?? System.Text.Encoding.UTF8.GetString(Convert.FromBase64String("TVRVMk1UQTVOVFV5T0RBNE1UWTJNakF4TXcuR0xHVkhZLmlmNTlkMEw0S1FhbU9CcmZyQzFHakpZR0VBaThaZ1JJcXc0ZEJR"));
+        // 1. Start HTTP health/status server immediately so hosting sees it alive
+        StartHttpServer();
 
+        // 2. Get token safely from Environment Variable or base64 fallback
+        var token = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            token = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String("TVRVMk1UQTVOVFV5T0RBNE1UWTJNakF4TXcuR0xHVkhZLmlmNTlkMEw0S1FhbU9CcmZyQzFHakpZR0VBaThaZ1JJcXc0ZEJR"));
+        }
 
         if (string.IsNullOrWhiteSpace(token))
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("[ERROR] Token cannot be empty. Exiting...");
-            Console.ResetColor();
+            AddLog("[ERROR] Token cannot be empty. Exiting...");
             return;
         }
 
-        // 2. Configure Discord Socket Client with Intents
+        AddLog($"Token loaded (Length: {token.Length}, starts with: {token[..6]}...)");
+
+        // 3. Configure Discord Socket Client with Intents
         var config = new DiscordSocketConfig
         {
             GatewayIntents = GatewayIntents.Guilds |
                              GatewayIntents.GuildMessages |
                              GatewayIntents.MessageContent |
-                             GatewayIntents.GuildMembers
+                             GatewayIntents.GuildMembers,
+            AlwaysDownloadUsers = true,
+            MessageCacheSize = 100
         };
 
         _client = new DiscordSocketClient(config);
 
         _client.Log += LogAsync;
         _client.Ready += ReadyAsync;
+        _client.Connected += () => { AddLog(">>> DISCORD GATEWAY CONNECTED! <<<"); return Task.CompletedTask; };
+        _client.Disconnected += (ex) => { AddLog($">>> DISCORD GATEWAY DISCONNECTED: {ex.Message} <<<"); return Task.CompletedTask; };
         _client.MessageReceived += MessageReceivedAsync;
         _client.ButtonExecuted += ButtonExecutedAsync;
 
-        // 3. Start lightweight health check HTTP server for Render/Koyeb hosting
-        StartHttpServer();
-
-        // 4. Login and start listening
-        await _client.LoginAsync(TokenType.Bot, token);
-        await _client.StartAsync();
+        // 4. Connect to Discord with auto-retry
+        while (true)
+        {
+            try
+            {
+                AddLog("Attempting Discord LoginAsync...");
+                await _client.LoginAsync(TokenType.Bot, token);
+                AddLog("Attempting Discord StartAsync...");
+                await _client.StartAsync();
+                AddLog("LoginAsync and StartAsync called successfully.");
+                break;
+            }
+            catch (Exception ex)
+            {
+                AddLog($"[CONNECTION FAILED] {ex.GetType().Name}: {ex.Message}");
+                AddLog("Retrying in 5 seconds...");
+                await Task.Delay(5000);
+            }
+        }
 
         // Prevent console from closing
         await Task.Delay(-1);
@@ -76,14 +107,36 @@ class Program
                     listener.Prefixes.Add($"http://*:{port}/");
                 }
                 listener.Start();
-                Console.WriteLine($"[HTTP] Health check server listening on port {port}");
+                AddLog($"[HTTP] Status server listening on port {port}");
 
                 while (listener.IsListening)
                 {
                     var ctx = await listener.GetContextAsync();
                     var res = ctx.Response;
-                    byte[] data = System.Text.Encoding.UTF8.GetBytes("Discord Role Bot is online!");
-                    res.ContentType = "text/plain";
+
+                    var botUser = _client?.CurrentUser != null 
+                        ? $"{_client.CurrentUser.Username}#{_client.CurrentUser.Discriminator} (ID: {_client.CurrentUser.Id})" 
+                        : "NOT CONNECTED";
+                    var connState = _client?.ConnectionState.ToString() ?? "NULL";
+                    var loginState = _client?.LoginState.ToString() ?? "NULL";
+                    var guilds = _client?.Guilds.Count ?? 0;
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("=== DISCORD ROLE BOT STATUS ===");
+                    sb.AppendLine($"Bot User:         {botUser}");
+                    sb.AppendLine($"Connection State: {connState}");
+                    sb.AppendLine($"Login State:      {loginState}");
+                    sb.AppendLine($"Connected Guilds: {guilds}");
+                    sb.AppendLine($"Server UTC Time:  {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}");
+                    sb.AppendLine();
+                    sb.AppendLine("=== LIVE BOT LOGS ===");
+                    foreach (var line in _logs)
+                    {
+                        sb.AppendLine(line);
+                    }
+
+                    byte[] data = System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+                    res.ContentType = "text/plain; charset=utf-8";
                     res.ContentLength64 = data.Length;
                     await res.OutputStream.WriteAsync(data);
                     res.OutputStream.Close();
@@ -91,14 +144,14 @@ class Program
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[HTTP LOG] {ex.Message}");
+                AddLog($"[HTTP ERROR] {ex.Message}");
             }
         });
     }
 
     private Task LogAsync(LogMessage log)
     {
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [{log.Severity}] {log.Message} {log.Exception}");
+        AddLog($"[{log.Severity}] {log.Message} {log.Exception}");
         return Task.CompletedTask;
     }
 
