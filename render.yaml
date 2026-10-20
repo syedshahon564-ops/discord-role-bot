@@ -3,6 +3,7 @@ services:
     name: discord-role-bot
     env: docker
     plan: free
+    region: frankfurt
     healthCheckPath: /
     envVars:
       - key: PORT
